@@ -35,11 +35,15 @@
 # One-line startup command (paste into RunPod "Start Command"):
 #
 #   bash run_train.sh --s3-bucket my-bucket \
-#     --s3-data-tarball s3://my-bucket/omr-data/verovio-fixed.tar.gz --expected-samples 99771 \
-#     --s3-data-tarball s3://my-bucket/omr-data/lilypond-fixed.tar.gz --expected-samples 10000 \
+#     --data-tarball https://huggingface.co/datasets/woodylks/omr-data/resolve/main/verovio-fixed.tar --expected-samples 99771 \
+#     --data-tarball https://huggingface.co/datasets/woodylks/omr-data/resolve/main/lilypond-fixed.tar --expected-samples 10000 \
 #     --s3-output-prefix omr-runs/full-20261006/ \
 #     --pkg s3://my-bucket/omr-code/training-pkg-abc123.tar.gz \
 #     --epochs 30
+#
+# v7 (2026-10-07): data tarballs moved to Hugging Face Hub — pod->RunPod-S3
+# is throttled to 0.03 MB/s (Elon speedtest, team-ops #26). https:// URLs
+# download via curl (-C - resume); s3:// still supported as fallback.
 #
 # run_smoke.sh is a thin wrapper: 1 epoch, smoke output prefix.
 #
@@ -80,14 +84,17 @@ usage() {
 
 Arguments:
   --s3-bucket BUCKET            (required) S3 bucket for data + outputs
-  --s3-data-tarball s3://...    (repeatable) pre-packed data tarball(s), one
-                                per data source. Single HTTP download + tar xf (auto-detect)
+  --data-tarball URL          (repeatable) pre-packed data tarball(s), one
+                                per data source. URL may be s3:// (via aws s3)
+                                or https:// (via curl, e.g. Hugging Face Hub).
+                                Single download + tar xf (auto-detect)
                                 per tarball — PREFERRED over --s3-data-prefix
                                 (220k small-file syncs are slow and blind).
-                                Either --s3-data-tarball or --s3-data-prefix
+                                Either --data-tarball or --s3-data-prefix
                                 is required.
+                                (--s3-data-tarball is kept as an alias.)
   --expected-samples N          expected sample count for the most recent
-                                --s3-data-tarball; mismatch fails fast
+                                --data-tarball; mismatch fails fast
   --s3-data-prefix PREFIX       (repeatable, legacy fallback) per-file sync,
                                 e.g. omr-data/verovio-fixed/
   --s3-output-prefix PREFIX     (required) run outputs go here, e.g.
@@ -127,9 +134,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --s3-bucket)            S3_BUCKET="$2"; shift 2 ;;
     --s3-data-prefix)       S3_DATA_PREFIXES+=("$2"); shift 2 ;;
-    --s3-data-tarball)      S3_DATA_TARBALLS+=("$2"); EXPECTED_SAMPLES+=(""); shift 2 ;;
+    --data-tarball|--s3-data-tarball)
+                            S3_DATA_TARBALLS+=("$2"); EXPECTED_SAMPLES+=(""); shift 2 ;;
     --expected-samples)     [[ ${#S3_DATA_TARBALLS[@]} -gt 0 ]] \
-                              || die "--expected-samples must follow a --s3-data-tarball"
+                              || die "--expected-samples must follow a --data-tarball"
                             EXPECTED_SAMPLES[$(( ${#S3_DATA_TARBALLS[@]} - 1 ))]="$2"; shift 2 ;;
     --staging-timeout)      STAGING_TIMEOUT_MIN="$2"; shift 2 ;;
     --s3-output-prefix)     S3_OUT_PREFIX="$2"; shift 2 ;;
@@ -159,7 +167,7 @@ done
 [[ -n "$S3_BUCKET" ]]      || die "--s3-bucket is required"
 [[ -n "$S3_OUT_PREFIX" ]]  || die "--s3-output-prefix is required"
 [[ ${#S3_DATA_PREFIXES[@]} -gt 0 || ${#S3_DATA_TARBALLS[@]} -gt 0 ]] \
-  || die "at least one --s3-data-prefix or --s3-data-tarball is required"
+  || die "at least one --s3-data-prefix or --data-tarball is required"
 [[ -n "$PKG" ]]             || die "--pkg is required"
 # normalise prefixes: exactly one trailing slash (tarballs are full s3:// URLs, untouched)
 norm() { local p="${1#/}"; p="${p%/}/"; printf '%s' "$p"; }
@@ -221,6 +229,48 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 S3MINI_PY="$SCRIPT_DIR/s3mini.py"  # kept for reference only; S3 ops use the
 # official AWS CLI now (s3mini.py SigV4 proved broken 2026-10-06)
 s3() { aws s3 "$@" --endpoint-url "$S3_ENDPOINT_URL" --region "${S3_REGION:-us-ca-2}"; }
+
+# v7: Hugging Face Hub data source (2026-10-07). Pod->RunPod-S3 is throttled
+# to 0.03 MB/s (600x slower than pod->internet); data tarballs now live on
+# HF Hub (free CDN, ~18 MB/s). curl handles https:// URLs with resume.
+
+# HEAD request for Content-Length (follows redirects, e.g. HF Hub -> CDN).
+# Prints the byte count, or empty on failure.
+http_size() {
+  curl -sIL --max-time 30 "$1" 2>/dev/null \
+    | grep -i '^content-length:' | tail -1 | awk '{print $2}' | tr -d '\r'
+}
+
+# Download $1 (s3:// or https:// URL) to $2, with retry.
+#  s3://    -> aws s3 cp (no resume; partial discarded before retry, v6 logic)
+#  https:// -> curl -fL -C - (auto-resume partial) + --retry-all-errors
+# Returns 0 on success, 1 after 5 failed attempts. Errors are logged.
+download_url() {
+  local url="$1" dest="$2" attempt dl_err
+  for attempt in 1 2 3 4 5; do
+    dl_err="$WORKDIR/dl_$(basename "$dest")_attempt${attempt}.err"
+    if [[ "$url" == s3://* ]]; then
+      if s3 cp "$url" "$dest" --quiet 2>"$dl_err"; then
+        rm -f "$dl_err"; return 0
+      fi
+    else
+      if curl -fL -C - --retry 5 --retry-delay 5 --retry-all-errors \
+              --max-time 1800 -o "$dest" "$url" 2>"$dl_err"; then
+        rm -f "$dl_err"; return 0
+      fi
+    fi
+    log "download attempt $attempt/5 FAILED for $url: $(tail -c 500 "$dl_err" | tr '\n\r' '  ')"
+    # s3 has no resume: discard partial before retry. curl -C - resumes, so
+    # keep the partial file for https://.
+    [[ "$url" == s3://* ]] && rm -f "$dest"
+    if [[ "$attempt" -lt 5 ]]; then
+      local nap=$(( 2 ** attempt ))
+      log "retrying in ${nap}s ..."
+      sleep "$nap"
+    fi
+  done
+  return 1
+}
 
 # ------------------------------------------------------- self-terminate -----
 # Defined early: the staging watchdog (below) may need it before training.
@@ -294,14 +344,23 @@ for pfx in "${S3_DATA_PREFIXES[@]}"; do
 done
 declare -a S3_TARBALL_SIZES=()
 for tb in "${S3_DATA_TARBALLS[@]}"; do
-  [[ "$tb" == s3://* ]] || die "--s3-data-tarball must be a full s3:// URL (got '$tb')"
-  bn="$(basename "$tb")"
-  sz=$(s3 ls "$tb" 2>/dev/null | awk -v bn="$bn" '$4==bn {print $3}')
-  if ! [[ "$sz" =~ ^[0-9]+$ ]] || [[ "$sz" -le 0 ]]; then
-    die "data tarball $tb is missing on S3 (aws s3 ls returned nothing usable)"
+  if [[ "$tb" == s3://* ]]; then
+    bn="$(basename "$tb")"
+    sz=$(s3 ls "$tb" 2>/dev/null | awk -v bn="$bn" '$4==bn {print $3}')
+    if ! [[ "$sz" =~ ^[0-9]+$ ]] || [[ "$sz" -le 0 ]]; then
+      die "data tarball $tb is missing on S3 (aws s3 ls returned nothing usable)"
+    fi
+  elif [[ "$tb" == https://* ]]; then
+    # v7: HF Hub / CDN — size via HEAD Content-Length (follows redirects)
+    sz=$(http_size "$tb")
+    if ! [[ "$sz" =~ ^[0-9]+$ ]] || [[ "$sz" -le 0 ]]; then
+      die "data tarball $tb: cannot get Content-Length via HEAD — check URL"
+    fi
+  else
+    die "--data-tarball must be an s3:// or https:// URL (got '$tb')"
   fi
   S3_TARBALL_SIZES+=("$sz")
-  log "data tarball OK: $tb ($(( sz / 1024 / 1024 ))MB on S3)"
+  log "data tarball OK: $tb ($(( sz / 1024 / 1024 ))MB)"
 done
 # dynamic disk check (2026-10-06: Verovio tarball alone is 8.5GB — the old
 # static >3GB check would let the run die mid-download, burning GPU money).
@@ -326,9 +385,9 @@ s3 rm "$CANARY" >/dev/null 2>&1 || true
 log "S3 output writable: s3://$S3_BUCKET/$S3_OUT_PREFIX"
 
 # ------------------------------------------------------ fail fast: packaging -
-if [[ "$PKG" == s3://* ]]; then
+if [[ "$PKG" == s3://* || "$PKG" == https://* ]]; then
   log "downloading training package: $PKG"
-  s3 cp "$PKG" "$WORKDIR/training-pkg.tar.gz" >/dev/null \
+  download_url "$PKG" "$WORKDIR/training-pkg.tar.gz" \
     || die "cannot download training package $PKG"
   PKG="$WORKDIR/training-pkg.tar.gz"
 fi
@@ -425,7 +484,7 @@ stop_staging_monitor() {
 
 # ------------------------------------------------------------- stage data ---
 # Two modes:
-#   TARBALL MODE (preferred): one HTTP download per --s3-data-tarball, tar xf,
+#   TARBALL MODE (preferred): one download per --data-tarball, tar xf,
 #     verify extracted counts vs --expected-samples. Fast: single stream, no
 #     220k round-trips. Tarball internals may nest arbitrarily (recursive find).
 #   LEGACY MODE (fallback): per-file `aws s3 sync` per --s3-data-prefix.
@@ -464,47 +523,32 @@ if [[ ${#S3_DATA_TARBALLS[@]} -gt 0 ]]; then
     need_b=$(( sz * 2 + 2 * 1024 * 1024 * 1024 ))
     [[ "$free_b" -gt "$need_b" ]] \
       || die "DISK: need $(( need_b / 1024 / 1024 / 1024 ))GB free for $tb, have $(( free_b / 1024 / 1024 / 1024 ))GB"
-    # v6: skip-if-complete — a fully downloaded tarball from a previous
-    # container run is reused (size must match S3). A partial file is
-    # discarded for a clean retry (aws s3 cp has no resume; a corrupt
-    # partial is worse than a fresh download).
+    # skip-if-complete — a fully downloaded tarball from a previous
+    # container run is reused (size must match). For s3:// a partial file is
+    # discarded (aws s3 cp has no resume); for https:// the partial is KEPT
+    # and curl -C - resumes it.
     if [[ -f "$fn" ]]; then
       fbytes=$(stat -c%s "$fn")
       if [[ "$fbytes" -eq "$sz" ]]; then
-        log "tarball $i already downloaded ($(( fbytes / 1024 / 1024 ))MB == S3 size), skipping download"
+        log "tarball $i already downloaded ($(( fbytes / 1024 / 1024 ))MB == expected size), skipping download"
+      elif [[ "$tb" == https://* ]]; then
+        log "tarball $i partial download ($fbytes of $sz bytes), curl will resume"
       else
         log "tarball $i partial download ($fbytes of $sz bytes), discarding for clean retry"
         rm -f "$fn"
       fi
     fi
-    if [[ ! -f "$fn" ]]; then
+    if [[ ! -f "$fn" ]] || [[ "$(stat -c%s "$fn")" -ne "$sz" ]]; then
       hb_write "download" "$i" "${#S3_DATA_TARBALLS[@]}" "$sz" "downloading $tb ($(( sz / 1024 / 1024 ))MB)"; hb_push
       log "downloading $tb ($(( sz / 1024 / 1024 ))MB) ..."
-      # v6: retry with exponential backoff. 2026-10-07 incident: the 8.6GB
-      # verovio tarball died ~5min in (rc=255) on EVERY attempt — likely a
-      # transient S3-gateway/network drop on the long multipart download.
-      # aws stderr is captured and logged (previously >/dev/null hid the real
-      # error); the log is synced to S3 so the next failure is diagnosable.
-      dl_ok=0
-      for attempt in 1 2 3 4 5; do
-        dl_err="$WORKDIR/dl_${i}_attempt${attempt}.err"
-        if s3 cp "$tb" "$fn" --quiet 2>"$dl_err"; then
-          dl_ok=1; rm -f "$dl_err"; break
-        fi
-        log "download attempt $attempt/5 FAILED for $tb: $(tail -c 500 "$dl_err" | tr '\n\r' '  ')"
-        rm -f "$fn"  # discard partial before retry
-        if [[ "$attempt" -lt 5 ]]; then
-          nap=$(( 2 ** attempt ))
-          log "retrying in ${nap}s ..."
-          sleep "$nap"
-        fi
-      done
-      [[ "$dl_ok" == "1" ]] \
-        || die "download failed after 5 attempts: $tb (aws error logged above)"
+      # v7: download_url() — s3:// via aws s3 cp, https:// via curl -C -
+      # (resume) with retry. stderr captured per attempt and logged.
+      download_url "$tb" "$fn" \
+        || die "download failed after 5 attempts: $tb (error logged above)"
     fi
     fbytes=$(stat -c%s "$fn")
     [[ "$fbytes" -eq "$sz" ]] \
-      || die "SIZE MISMATCH: $tb downloaded $fbytes bytes, S3 says $sz — truncated download, refusing to untar"
+      || die "SIZE MISMATCH: $tb downloaded $fbytes bytes, expected $sz — truncated download, refusing to untar"
     log "downloaded $(( fbytes / 1024 / 1024 ))MB, size verified"
     hb_write "untar" "$i" "${#S3_DATA_TARBALLS[@]}" "$fbytes" "extracting $tb"; hb_push
     log "extracting ..."
