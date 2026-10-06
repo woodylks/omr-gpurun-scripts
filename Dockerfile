@@ -8,8 +8,8 @@
 # Baked scripts (public repo woodylks/omr-gpurun-scripts):
 #   /opt/omr/run_train.sh  — training runner (locates s3mini.py via
 #                            BASH_SOURCE[0], needs nothing from PATH/cwd)
-#   /opt/omr/s3mini.py     — stdlib-only S3 client (urllib + SigV4 header
-#                            auth, zero dependencies, works on any image)
+#   /opt/omr/s3mini.py     — RETIRED 2026-10-06 (SigV4 bug, SignatureDoesNotMatch);
+#                            kept in image for reference, no longer called
 #   /opt/omr/bootstrap.py  — kept for reference (no longer needed at startup)
 #
 # Pod startup becomes trivial (Elon fills in <training-pkg> and <endpoint>):
@@ -22,11 +22,17 @@
 #     --s3-endpoint-url <endpoint> \
 #     --epochs 30 --no-terminate
 #
-# Data + training package are still pulled from S3 at RUNTIME via s3mini.py
-# (stdlib, no aws CLI needed).
+# Data + training package are pulled from S3 at RUNTIME via the official
+# AWS CLI (pip-installed below).
 
 ARG BASE_TAG=2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 FROM runpod/pytorch:${BASE_TAG}
+
+# Official AWS CLI — S3 client for run_train.sh (replaces hand-rolled
+# s3mini.py, whose SigV4 proved broken 2026-10-06). Own layer BEFORE the
+# COPY so script edits don't invalidate the pip cache.
+RUN pip install --no-cache-dir awscli \
+    && aws --version
 
 # Bake the training scripts in — nothing to download at pod startup.
 COPY bootstrap.py s3mini.py run_train.sh start.sh /opt/omr/
