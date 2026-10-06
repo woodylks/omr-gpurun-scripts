@@ -158,6 +158,12 @@ class S3:
         url = self._url(bucket, key, query)
         hdrs = auth_headers(method, url, list(query), self.ak, self.sk,
                             self.region, "s3", payload_hash)
+        # Cloudflare 1010: the S3-compatible endpoint sits behind Cloudflare,
+        # which blocks requests without a browser User-Agent. Added AFTER
+        # signing so it stays out of the SigV4 signed-header set.
+        hdrs["User-Agent"] = ("Mozilla/5.0 (X11; Linux x86_64) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/131.0.0.0 Safari/537.36")
         if length is not None:
             hdrs["Content-Length"] = str(length)
         if ctype:
