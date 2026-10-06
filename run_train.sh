@@ -190,9 +190,15 @@ if [[ -z "$VOLUME_DIR" && -d /workspace && -w /workspace ]]; then
 fi
 if [[ -n "$VOLUME_DIR" ]]; then
   [[ -d "$VOLUME_DIR" && -w "$VOLUME_DIR" ]] || die "--volume-dir $VOLUME_DIR not writable"
-  WORKDIR="$VOLUME_DIR/omr-run-$(date -u +%Y%m%d-%H%M%S)"
+  # v6: FIXED workdir (no timestamp). 2026-10-07 incident: the container
+  # crash-looped ~every 5min during the 8.6GB download; each restart made a NEW
+  # timestamped workdir, orphaning the 3.2GB partial download and restarting
+  # from scratch (6.5hrs / $4.80 burned). A fixed path lets restarts reuse
+  # completed downloads. The S3 *output* prefix keeps its timestamp (start.sh)
+  # for result uniqueness; only the LOCAL workdir is fixed.
+  WORKDIR="$VOLUME_DIR/omr-staging"
 else
-  WORKDIR="$HOME/omr-run-$(date -u +%Y%m%d-%H%M%S)"
+  WORKDIR="$HOME/omr-staging"
 fi
 mkdir -p "$WORKDIR"
 STAGE="$WORKDIR/stage"; CODE="$WORKDIR/code"; OUT="$WORKDIR/out"
@@ -437,15 +443,65 @@ if [[ ${#S3_DATA_TARBALLS[@]} -gt 0 ]]; then
     sz="${S3_TARBALL_SIZES[$i]}"
     d="$STAGE/tar_$i"; mkdir -p "$d"
     fn="$WORKDIR/data_$i.tar.gz"
+    # v6: skip entirely if already extracted in a previous container run.
+    # (Fixed WORKDIR survives restarts; verified by sample count, and the
+    # count check after extraction below guards against partial extracts.)
+    if [[ -n "$exp" ]]; then
+      already=$(find "$d" -name '*.tokens.txt' 2>/dev/null | wc -l)
+      if [[ "$already" -eq "$exp" ]]; then
+        log "tarball $i already extracted ($already samples == expected $exp), skipping download+extract"
+        STAGE_DIRS+=("$d/")
+        STAGE_LABELS+=("tarball:$tb")
+        hb_write "tarball-done" "$(( i + 1 ))" "${#S3_DATA_TARBALLS[@]}" "$sz" "$already samples from $tb (cached from previous run)"; hb_push
+        continue
+      elif [[ "$already" -gt 0 ]]; then
+        log "tarball $i partially extracted ($already of $exp samples), clearing for clean re-extract"
+        rm -rf "${d:?}/"*
+      fi
+    fi
     # per-tarball disk recheck (free space may have shrunk since fail-fast)
     free_b=$(( $(free_kb) * 1024 ))
     need_b=$(( sz * 2 + 2 * 1024 * 1024 * 1024 ))
     [[ "$free_b" -gt "$need_b" ]] \
       || die "DISK: need $(( need_b / 1024 / 1024 / 1024 ))GB free for $tb, have $(( free_b / 1024 / 1024 / 1024 ))GB"
-    hb_write "download" "$i" "${#S3_DATA_TARBALLS[@]}" "$sz" "downloading $tb ($(( sz / 1024 / 1024 ))MB)"; hb_push
-    log "downloading $tb ($(( sz / 1024 / 1024 ))MB) ..."
-    s3 cp "$tb" "$fn" >/dev/null \
-      || die "download failed: $tb"
+    # v6: skip-if-complete — a fully downloaded tarball from a previous
+    # container run is reused (size must match S3). A partial file is
+    # discarded for a clean retry (aws s3 cp has no resume; a corrupt
+    # partial is worse than a fresh download).
+    if [[ -f "$fn" ]]; then
+      fbytes=$(stat -c%s "$fn")
+      if [[ "$fbytes" -eq "$sz" ]]; then
+        log "tarball $i already downloaded ($(( fbytes / 1024 / 1024 ))MB == S3 size), skipping download"
+      else
+        log "tarball $i partial download ($fbytes of $sz bytes), discarding for clean retry"
+        rm -f "$fn"
+      fi
+    fi
+    if [[ ! -f "$fn" ]]; then
+      hb_write "download" "$i" "${#S3_DATA_TARBALLS[@]}" "$sz" "downloading $tb ($(( sz / 1024 / 1024 ))MB)"; hb_push
+      log "downloading $tb ($(( sz / 1024 / 1024 ))MB) ..."
+      # v6: retry with exponential backoff. 2026-10-07 incident: the 8.6GB
+      # verovio tarball died ~5min in (rc=255) on EVERY attempt — likely a
+      # transient S3-gateway/network drop on the long multipart download.
+      # aws stderr is captured and logged (previously >/dev/null hid the real
+      # error); the log is synced to S3 so the next failure is diagnosable.
+      dl_ok=0
+      for attempt in 1 2 3 4 5; do
+        dl_err="$WORKDIR/dl_${i}_attempt${attempt}.err"
+        if s3 cp "$tb" "$fn" --quiet 2>"$dl_err"; then
+          dl_ok=1; rm -f "$dl_err"; break
+        fi
+        log "download attempt $attempt/5 FAILED for $tb: $(tail -c 500 "$dl_err" | tr '\n\r' '  ')"
+        rm -f "$fn"  # discard partial before retry
+        if [[ "$attempt" -lt 5 ]]; then
+          nap=$(( 2 ** attempt ))
+          log "retrying in ${nap}s ..."
+          sleep "$nap"
+        fi
+      done
+      [[ "$dl_ok" == "1" ]] \
+        || die "download failed after 5 attempts: $tb (aws error logged above)"
+    fi
     fbytes=$(stat -c%s "$fn")
     [[ "$fbytes" -eq "$sz" ]] \
       || die "SIZE MISMATCH: $tb downloaded $fbytes bytes, S3 says $sz — truncated download, refusing to untar"
