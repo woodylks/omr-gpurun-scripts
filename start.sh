@@ -17,6 +17,7 @@ exec /opt/omr/run_train.sh \
   --s3-data-tarball s3://7bpajmibp1/omr-data-tarballs/lilypond-fixed.tar --expected-samples 10000 \
   --s3-output-prefix "omr-runs/full-110k-$(date -u +%Y%m%d-%H%M%S)/" \
   --s3-endpoint-url "$OMR_S3_ENDPOINT_URL" \
+  --s3-region "${OMR_S3_REGION:-us-ca-2}" \
   --aws-access-key-id "$AWS_ACCESS_KEY_ID" \
   --aws-secret-access-key "$AWS_SECRET_ACCESS_KEY" \
   --epochs "${OMR_EPOCHS:-30}" \
