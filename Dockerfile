@@ -29,11 +29,13 @@ ARG BASE_TAG=2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 FROM runpod/pytorch:${BASE_TAG}
 
 # Bake the training scripts in — nothing to download at pod startup.
-COPY bootstrap.py s3mini.py run_train.sh /opt/omr/
+COPY bootstrap.py s3mini.py run_train.sh start.sh /opt/omr/
 
 # Fail the BUILD (not the pod) if a script is broken.
 RUN chmod +x /opt/omr/run_train.sh \
     && ls -la /opt/omr/ \
     && bash -n /opt/omr/run_train.sh \
+    && bash -n /opt/omr/start.sh \
+    && chmod +x /opt/omr/start.sh \
     && python3 -c "import py_compile; py_compile.compile('/opt/omr/s3mini.py', doraise=True); py_compile.compile('/opt/omr/bootstrap.py', doraise=True)" \
     && echo "baked scripts OK"
