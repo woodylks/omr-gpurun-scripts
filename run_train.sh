@@ -212,8 +212,9 @@ log "bucket=$S3_BUCKET out=s3://$S3_BUCKET/$S3_OUT_PREFIX"
 # directory -- never PATH, never cwd, never pip. Works as
 # /opt/omr/run_train.sh, /tmp/run_train.sh, or a relative invocation.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-S3MINI_PY="$SCRIPT_DIR/s3mini.py"
-s3() { python3 "$S3MINI_PY" "$@" "${AWS_EXTRA[@]}"; }
+S3MINI_PY="$SCRIPT_DIR/s3mini.py"  # kept for reference only; S3 ops use the
+# official AWS CLI now (s3mini.py SigV4 proved broken 2026-10-06)
+s3() { aws s3 "$@" --endpoint-url "$S3_ENDPOINT_URL" --region "${S3_REGION:-us-ca-2}"; }
 
 # ------------------------------------------------------- self-terminate -----
 # Defined early: the staging watchdog (below) may need it before training.
